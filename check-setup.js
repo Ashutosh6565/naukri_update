@@ -280,11 +280,42 @@ async function checkSessions() {
       const text = await page
         .evaluate(() => document.body.innerText)
         .catch(() => "");
-      ok.test(text)
+      // The public jobs feed also contains words like "applied", so test for the
+      // login form instead of trusting the text.
+      const loginWall = await page
+        .evaluate(
+          () =>
+            !!document.querySelector(
+              'form#new_user, input#user_password, a[href*="/auth/google_oauth2"]',
+            ),
+        )
+        .catch(() => false);
+      !loginWall && ok.test(text)
         ? pass(label, "logged in")
-        : fail(label, "looks logged out — run the login step");
+        : fail(
+            label,
+            loginWall || /\/login/.test(page.url())
+              ? "session expired — run node wellfound-login.js"
+              : "looks logged out — run the login step",
+          );
 
       if (dir === ".wellfound-chrome-profile") {
+        // The applications page renders React rows with no links or ids; the job ids
+        // only exist in the GraphQL responses it fetches. Listen before navigating.
+        const gqlBodies = [];
+        page.on("response", (r) => {
+          if (
+            !/wellfound\.com\/graphql/.test(r.url()) ||
+            r.request().method() !== "POST"
+          )
+            return;
+          gqlBodies.push(
+            r
+              .text()
+              .then((t) => JSON.parse(t))
+              .catch(() => null),
+          );
+        });
         await page.goto("https://wellfound.com/jobs/applications", {
           waitUntil: "domcontentloaded",
           timeout: 45000,
@@ -292,32 +323,67 @@ async function checkSessions() {
         await page
           .waitForFunction(
             () =>
-              /Ongoing|Archived|No applications/i.test(document.body.innerText),
+              /Ongoing|Archived|No applications|don't have any applications/i.test(
+                document.body.innerText,
+              ),
             { timeout: 30000 },
           )
           .catch(() => {});
         await page.waitForTimeout(2500);
-        const ids = await page.evaluate(() => [
-          ...new Set(
-            [...document.querySelectorAll('a[href*="/jobs/applications/"]')]
-              .map((a) =>
-                (a.getAttribute("href") || "").match(
-                  /\/jobs\/applications\/\d+-(\d+)/,
-                ),
-              )
-              .filter(Boolean)
-              .map((m) => m[1]),
-          ),
-        ]);
-        ids.length
-          ? pass(
-              "wellfound applied list",
-              `${ids.length} applications readable (used for verification + seeding)`,
-            )
-          : fail(
-              "wellfound applied list",
-              "no applications parsed — verification would not work",
-            );
+        // Empty state, login wall and a changed row format are three different
+        // problems; reporting them as one "parser broken" message hid the real cause.
+        const list = await page.evaluate(() => {
+          const body = document.body.innerText;
+          return {
+            loginWall: !!document.querySelector(
+              'form#new_user, input#user_password, a[href*="/auth/google_oauth2"]',
+            ),
+            empty: /don't have any applications|no applications yet|no applications/i.test(
+              body,
+            ),
+            rows: [...document.querySelectorAll('[class*="styles_content"]')].length,
+          };
+        });
+        // pendingJobApplications is a plain array; ongoingJobApplications is a
+        // paginated connection whose node may hold the listing directly or nested.
+        const ids = new Set();
+        const walk = (node) => {
+          if (!node || typeof node !== "object") return;
+          if (Array.isArray(node)) return node.forEach(walk);
+          if (node.jobListing && node.jobListing.id) ids.add(String(node.jobListing.id));
+          for (const v of Object.values(node)) walk(v);
+        };
+        for (const body of (await Promise.all(gqlBodies)).filter(Boolean)) {
+          const talent = body && body.data && body.data.talent;
+          if (!talent) continue;
+          for (const key of ["pendingJobApplications", "ongoingJobApplications"]) {
+            const v = talent[key];
+            if (!v) continue;
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (Array.isArray(v.edges)) v.edges.forEach((e) => walk(e && e.node));
+          }
+        }
+        if (list.loginWall) {
+          fail(
+            "wellfound applied list",
+            "session expired — run node wellfound-login.js",
+          );
+        } else if (ids.size) {
+          pass(
+            "wellfound applied list",
+            `${ids.size} applications readable (used for verification + seeding)`,
+          );
+        } else if (list.empty) {
+          pass(
+            "wellfound applied list",
+            "logged in — no applications yet, nothing to seed",
+          );
+        } else {
+          fail(
+            "wellfound applied list",
+            `applications page loaded (${list.rows} rows) but no job id was harvested — GraphQL parser needs updating`,
+          );
+        }
       }
     } catch (e) {
       fail(label, e.message.split("\n")[0].slice(0, 90));

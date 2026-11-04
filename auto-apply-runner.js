@@ -14,6 +14,7 @@
  */
 const path = require('path');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 const { CV, geminiKey, resumePath: RESUME_PATH } = require('./config'); // personal data from .env
 const { minimizeBrowserWindows, hideBrowserWindows, SHOW_FLAG } = require('./window-utils');
 const { applyExternal } = require('./external-apply'); // "Apply on company site" jobs, driven from Node
@@ -108,14 +109,22 @@ const SITES = {
       'https://www.naukri.com/mern-stack-developer-jobs?experience=1',
       'https://www.naukri.com/react-js-developer-jobs?experience=1',
       'https://www.naukri.com/node-js-developer-jobs?experience=1',
+      // The seen-list in the profile is permanent, so the six feeds above are mostly
+      // "already seen" within a day or two. These add fresh inventory; all verified 200.
+      'https://www.naukri.com/frontend-developer-jobs?experience=1',
+      'https://www.naukri.com/javascript-developer-jobs?experience=1',
+      'https://www.naukri.com/web-developer-jobs?experience=1',
+      'https://www.naukri.com/software-engineer-jobs?experience=1',
+      'https://www.naukri.com/angular-developer-jobs?experience=1',
+      'https://www.naukri.com/react-native-developer-jobs?experience=1',
     ],
     loginUrl: 'https://www.naukri.com/nlogin/login',
     // inject only on search pages (…-jobs…), never into the job popup the script drives itself
     injectOn: (url) => /naukri\.com\/[^?]*-jobs/.test(url),
     submittedRe: /✅ applied|DRY_RUN — would click/,
     storeKey: 'autoApplyNaukri',
-    dailyCap: 20,
-    perRun: 10, // 10 per hourly run; the 20/day cap still decides when the day ends
+    dailyCap: 50,
+    perRun: 10, // 10 per hourly run; 50 + Wellfound's 50 = the 100/day target
     // ~85-90% of Naukri dev listings are "Apply on company site" — follow them
     // onto the employer's own form instead of skipping them.
     externalApply: true,
@@ -140,9 +149,59 @@ const bumpDayCount = () => { dayState.count++; try { fs.writeFileSync(STATE_FILE
 const TARGET = Math.min(site.perRun || DAILY_CAP, DAILY_CAP - dayState.count);
 const MAX_RUNTIME_MS = 100 * 60 * 1000;
 const MAX_RESTARTS = 8; // browser gets closed and reopened this many times before giving up
+
+// One run per site. Task Scheduler's StopExisting kills the wscript wrapper but has
+// been observed to leave the node child (and its Chrome) alive, so a replacement
+// trigger would launch a second browser against the same profile. The lock makes the
+// replacement explicit: take over a stale holder, wait out a live one.
+const LOCK_FILE = path.join(__dirname, `apply-lock-${SITE_ARG}.json`);
+const isRunner = (pid) => {
+  const r = spawnSync('powershell', ['-NoProfile', '-Command',
+    `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.Name + "|" + $p.CommandLine }`],
+    { encoding: 'utf8', timeout: 15000 });
+  const out = String(r.stdout || '');
+  return /node\.exe/i.test(out) && out.includes('auto-apply-runner') && out.includes(SITE_ARG);
+};
+function acquireLock() {
+  const staleAfter = MAX_RUNTIME_MS + 10 * 60 * 1000;
+  try {
+    const prev = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8').replace(/^﻿/, ''));
+    if (prev && prev.pid && prev.pid !== process.pid) {
+      let alive = true;
+      try { process.kill(prev.pid, 0); } catch (e) { alive = false; }
+      const age = Date.now() - (prev.startedAt || 0);
+      if (alive && age > staleAfter && isRunner(prev.pid)) {
+        log(`Previous ${SITE_ARG} run (pid ${prev.pid}) is ${Math.round(age / 60000)} min old — terminating it.`);
+        spawnSync('taskkill', ['/PID', String(prev.pid), '/T', '/F'], { timeout: 20000 });
+        spawnSync('powershell', ['-NoProfile', '-Command',
+          `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -match '${site.profile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`],
+          { timeout: 30000 });
+      } else if (alive) {
+        log(`Another ${SITE_ARG} run is active (pid ${prev.pid}, ${Math.round(age / 60000)} min in) — leaving it to finish.`);
+        return false;
+      }
+    }
+  } catch (e) { /* no lock, or it was torn down mid-read — take it */ }
+  try { fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, startedAt: Date.now() })); } catch (e) {}
+  process.on('exit', () => {
+    try {
+      const cur = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8').replace(/^﻿/, ''));
+      if (cur.pid === process.pid) fs.unlinkSync(LOCK_FILE);
+    } catch (e) {}
+  });
+  return true;
+}
 const IDLE_ROTATE_MS = 4 * 60 * 1000;
 
-const log = (msg) => console.log(`[${new Date().toLocaleString()}] [${SITE_ARG}] ${msg}`);
+// Scheduled runs are launched hidden by wscript, so console output is lost. Also
+// append to a per-site log file, otherwise a failed hourly run leaves no evidence.
+const log = (msg) => {
+  const line = `[${new Date().toLocaleString()}] [${SITE_ARG}] ${msg}`;
+  console.log(line);
+  try {
+    fs.appendFileSync(path.join(__dirname, `auto-apply-${SITE_ARG}.log`), line + '\n');
+  } catch (e) {}
+};
 
 // ======== CSV log of every submitted application (created once, appended forever) ========
 const CSV_FILE = path.join(__dirname, 'applications.csv');
@@ -204,6 +263,7 @@ function buildInjection() {
     log(`Daily cap of ${DAILY_CAP} applications already reached (${dayState.count} today) — exiting.`);
     return;
   }
+  if (!LOGIN_MODE && !acquireLock()) return;
   const launch = () => chromium.launchPersistentContext(path.join(__dirname, site.profile), {
     channel: 'chrome',
     headless: false, // bot checks block headless; headed + minimised instead (same trick as naukri refresh)
@@ -268,6 +328,10 @@ function buildInjection() {
   let searchIdx = 0;
   let pendingJob = null; // details of the job currently being applied to, for the CSV
   const externalQueue = [];              // "Apply on company site" jobs, handled in Node
+  // CSV rows are written after the applied-list check, which takes seconds. A run that
+  // hits its target closes the browser immediately after the last send, so without
+  // waiting here the final row (and any row mid-verification) is silently lost.
+  const pendingCsv = [];
   // Tabs opened purely to read the site's applied-list. They are on the same origin as
   // the feed, so without this the supervisor would inject the apply script into them.
   const VERIFY_PAGES = new Set();
@@ -284,7 +348,48 @@ function buildInjection() {
    * into it, and always closes it.
    */
   /**
-   * Every /jobs/<id>-slug currently listed on the site's applied page.
+   * Collect JSON bodies of the GraphQL calls the applications page makes itself.
+   * The page renders rows from Apollo (`OngoingApplicationList`, `PendingJobApplicationList`)
+   * and the DOM carries no job ids or links, so the responses are the only reliable source.
+   * Must be attached BEFORE navigation. Returns promises of parsed bodies (or null).
+   */
+  function watchGraphql(page) {
+    const bodies = [];
+    page.on('response', (r) => {
+      if (!/wellfound\.com\/graphql/.test(r.url()) || r.request().method() !== 'POST') return;
+      bodies.push(r.text().then((t) => JSON.parse(t)).catch(() => null));
+    });
+    return bodies;
+  }
+
+  /**
+   * Every job id in a batch of GraphQL responses: pending applications are a plain
+   * array, ongoing ones a paginated connection. Anything without `jobListing` (toasts,
+   * tracking calls) is ignored, so no false ids enter the seen-list.
+   */
+  function harvestAppliedIds(bodies) {
+    const ids = new Set();
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (node.jobListing && node.jobListing.id) ids.add(String(node.jobListing.id));
+      for (const v of Object.values(node)) walk(v);
+    };
+    for (const body of bodies) {
+      const talent = body && body.data && body.data.talent;
+      if (!talent) continue;
+      for (const key of ['pendingJobApplications', 'ongoingJobApplications']) {
+        const v = talent[key];
+        if (!v) continue;
+        if (Array.isArray(v)) v.forEach(walk);
+        else if (Array.isArray(v.edges)) v.edges.forEach((e) => walk(e && e.node));
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * Every /jobs/<id> currently listed on the site's applied page.
    * Best-effort: an empty list simply means no seeding, never a failed run.
    */
   async function collectAppliedSlugs(context) {
@@ -293,20 +398,22 @@ function buildInjection() {
     try {
       page = await context.newPage();
       VERIFY_PAGES.add(page);
+      const bodies = watchGraphql(page);
       await page.goto(site.appliedListUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForFunction(
         () => /Ongoing|Archived|No applications/i.test(document.body.innerText),
         { timeout: 30000 }
       ).catch(() => {});
       await page.waitForTimeout(2500);
-      // Applied rows link as /jobs/applications/<applicationId>-<jobId>; the job id is
-      // the second number. An earlier version matched /jobs/<digits>, which never fires
-      // on this page and silently seeded nothing.
-      return await page.evaluate(() =>
-        [...new Set([...document.querySelectorAll('a[href*="/jobs/applications/"]')]
-          .map((a) => (a.getAttribute('href') || '').match(/\/jobs\/applications\/\d+-(\d+)/))
-          .filter(Boolean).map((m) => '/jobs/' + m[1]))]
-      );
+      // A logged-out profile still renders the public shell, so an empty list looks
+      // exactly like "nothing applied yet". Say which one it is.
+      if (await page.evaluate(() => !!document.querySelector('form#new_user, input#user_password, a[href*="/auth/google_oauth2"]'))) {
+        log('  (Wellfound session expired — run: node wellfound-login.js)');
+        return [];
+      }
+      const ids = harvestAppliedIds((await Promise.all(bodies)).filter(Boolean));
+      if (!ids.size) log('  (applied list is empty — nothing to seed)');
+      return [...ids].map((id) => '/jobs/' + id);
     } catch (e) {
       log(`  (could not read applied list: ${String(e.message || e).split(String.fromCharCode(10))[0].slice(0, 80)})`);
       return [];
@@ -324,6 +431,7 @@ function buildInjection() {
       // "ctx is not defined" and report a real application as unverified.
       page = await context.newPage();
       VERIFY_PAGES.add(page);
+      const bodies = watchGraphql(page);
       await page.goto(site.appliedListUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
       // the list is client-rendered; wait for a row to exist rather than a fixed sleep
       await page.waitForFunction(
@@ -331,19 +439,27 @@ function buildInjection() {
         { timeout: 30000 }
       ).catch(() => {});
       await page.waitForTimeout(2500);
+      // Logged out, the applications page redirects to the login form. That is not
+      // evidence the application failed, so report it as unverifiable.
+      if (await page.evaluate(() => !!document.querySelector('form#new_user, input#user_password, a[href*="/auth/google_oauth2"]'))) {
+        log('  (Wellfound session expired — run: node wellfound-login.js)');
+        return 'unknown';
+      }
       const id = ((job.link || '').match(/\/jobs\/(\d+)/) || [])[1] || '';
       const company = (job.company || '').trim();
-      return await page.evaluate(([id, company]) => {
-        const html = document.body.innerHTML;
+      const ids = harvestAppliedIds((await Promise.all(bodies)).filter(Boolean));
+      // The job id in the payload is the strongest signal: a fresh submission shows up
+      // in the pending list immediately. Only conclusive when ids were actually read —
+      // an empty capture must not report a good application as missing.
+      if (id && ids.has(id)) return 'verified';
+      if (id && ids.size) return 'missing';
+      return await page.evaluate(([known, company]) => {
         const text = document.body.innerText;
-        if (!/Ongoing|Archived|No applications/i.test(text)) return 'unknown'; // page never rendered
-        // The job id is the strongest signal; the company name is the fallback for
-        // rows that link by slug only.
-        if (id && html.includes(id)) return 'verified';
+        if (!/Ongoing|Archived|No applications|don't have any applications/i.test(text)) return 'unknown'; // page never rendered
         // Plain substring match: a company name is literal text, and building a
         // regex from it only invited escaping bugs.
         if (company.length > 2 && text.toLowerCase().includes(company.toLowerCase())) return 'verified';
-        if (!id && !company) return 'unknown'; // nothing to match on
+        if (!known && !company) return 'unknown'; // nothing to match on
         return 'missing';
       }, [id, company]);
     } catch (e) {
@@ -398,8 +514,15 @@ function buildInjection() {
         setTimeout(() => {
           page.evaluate(() => {
             const q = (s) => document.querySelector(s)?.textContent?.trim() || '';
+            // The dialog header links to the company. The body-text fallback used to keep
+            // the whole tail of the line ("CertaActively HiringPromoted…"), so cut at the
+            // first badge/label that follows the name.
+            const dialog = [...document.querySelectorAll('[role="dialog"]')]
+              .find((d) => d.offsetWidth || d.offsetHeight);
+            const applyTo = (document.body.innerText.match(/Apply to ([^\n]{2,60})/i) || [])[1] || '';
             return {
-              company: (document.body.innerText.match(/Apply to (.{2,60})/) || [])[1]?.trim() ||
+              company: (dialog?.querySelector('a[href^="/company/"]')?.textContent || '').trim() ||
+                applyTo.replace(/\s*(?:Actively Hiring|Promoted|Hiring|•|\d+-\d+\s*Employees).*$/i, '').trim() ||
                 q('[data-testid="inlineHeader-companyName"]') || q('[data-company-name]') || q('a[href^="/company/"]'),
               salary: q('#salaryInfoAndJobType') || q('[data-testid*="salary" i]') ||
                 (document.body.innerText.match(/(?:₹|\$)\s?[\d,.]+(?:\s?-\s?(?:₹|\$)?[\d,.]+)?[^\n]{0,30}/) || [''])[0],
@@ -431,13 +554,14 @@ function buildInjection() {
           const job = pendingJob || { title: 'unknown' };
           // Verify against the site's own applied-list before writing the CSV row, so
           // the CSV records what actually registered rather than what we hoped did.
-          verifyInAppliedList(job, page.context()).then((v) => {
+          const write = verifyInAppliedList(job, page.context()).then((v) => {
             job.verified = v;
             if (v === 'verified') log(`  ✔ verified — job is in ${SITE_ARG}'s applied list`);
             else if (v === 'missing') log(`  ❌ NOT in ${SITE_ARG}'s applied list — the submission did not register`);
             else log('  ? verification unavailable — CSV row marked unverified');
             try { logApplication(job); } catch (e) { log('CSV write failed: ' + e.message); }
-          });
+          }).catch((e) => log('  ? verification failed — ' + String(e.message || e).split('\n')[0]));
+          pendingCsv.push(write);
         }
         pendingJob = null;
       }
@@ -526,10 +650,12 @@ function buildInjection() {
 
     // Work the external queue whenever the in-page script is idle, so the two
     // never drive the browser at the same time.
+    let externalWorked = false;
     while (site.externalApply && !anyBusy && externalQueue.length && submitted < TARGET && Date.now() < deadline) {
       const job = externalQueue.shift();
       log(`🔗 external: ${job.title}`);
-      const res = await applyExternal(ctx, job, { CV, live: LIVE, resumePath: RESUME_PATH, log });
+      externalWorked = true;
+      const res = await applyExternal(ctx, job, { CV, live: LIVE, resumePath: RESUME_PATH, geminiKey, log });
       lastActivity = Date.now();
       log(`   ${res.status}: ${res.detail}`);
       if (res.status === 'applied' || res.status === 'would-apply') {
@@ -556,7 +682,10 @@ function buildInjection() {
         // a bot-check, a dead SPA or a stale session produce the same "script ran,
         // applied nothing" cycle every time. After 3 fruitless cycles, hand back to
         // the caller so the browser is closed and reopened fresh.
-        if (submitted === submittedAtCycle) {
+        // Externals count as work: on Naukri almost every listing hands off to a
+        // company site, so an in-page-only counter restarted a perfectly healthy
+        // browser every 3 pages.
+        if (submitted === submittedAtCycle && !externalWorked) {
           if (++fruitless >= 3) {
             log('No applications in 3 script cycles — closing the browser and reopening.');
             return;
@@ -567,6 +696,12 @@ function buildInjection() {
     }
   }
   } finally {
+    // Let in-flight applied-list checks finish writing their CSV rows; a close here
+    // used to drop the submission that had just hit the run target.
+    await Promise.race([
+      Promise.allSettled(pendingCsv),
+      new Promise((r) => setTimeout(r, 30000)),
+    ]);
     await ctx.close().catch(() => {});
   }
   }

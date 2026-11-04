@@ -190,35 +190,90 @@ async function googleLogin(ctx, page) {
       });
     }
 
-    // Resume headline widget → pencil icon → textarea → save
+    // Resume headline widget → pencil icon → headline field → save
     const editIcon = page.locator(
       '#lazyResumeHead span.edit.icon, [data-ga-track*="resumeHeadline"] .edit',
     );
     await editIcon.first().waitFor({ timeout: 30000 });
     await editIcon.first().click();
 
-    const textarea = page.locator("#resumeHeadlineTxt");
-    await textarea.waitFor({ timeout: 15000 });
-    const current = (await textarea.inputValue()).trimEnd();
+    // Naukri changed the editor markup: #resumeHeadlineTxt is no longer present
+    // on every account. Prefer the field labelled "Resume headline", then fall
+    // back to the visible textarea/contenteditable inside the open editor.
+    const isFillableHeadline = (editor) =>
+      editor.evaluate((el) =>
+        el.matches("input, textarea") ||
+        el.isContentEditable ||
+        el.getAttribute("contenteditable") === "true",
+      );
+    const findHeadlineEditor = async () => {
+      const labelled = page.getByLabel(/resume headline/i).first();
+      if (
+        (await labelled.isVisible().catch(() => false)) &&
+        (await isFillableHeadline(labelled).catch(() => false))
+      ) {
+        return labelled;
+      }
+      return page
+        .locator(
+          '#resumeHeadlineTxt:visible, textarea:visible, [contenteditable="true"]:visible, input[aria-label*="headline" i]:visible, input[name*="headline" i]:visible',
+        )
+        .last();
+    };
+    const waitForHeadlineEditor = async () => {
+      const editor = await findHeadlineEditor();
+      try {
+        await editor.waitFor({ state: "visible", timeout: 15000 });
+      } catch {
+        throw new Error(
+          "headline dialog opened, but no visible labelled field, textarea, or contenteditable was found",
+        );
+      }
+      if (!(await isFillableHeadline(editor).catch(() => false))) {
+        const tag = await editor.evaluate((el) => `${el.tagName.toLowerCase()} role=${el.getAttribute("role") || "none"}`).catch(() => "unknown element");
+        throw new Error(`headline field selector matched a non-editable ${tag}`);
+      }
+      return editor;
+    };
+    const readHeadlineEditor = (editor) =>
+      editor.evaluate((el) => ("value" in el ? el.value : el.innerText || el.textContent || ""));
+
+    let headlineEditor = await waitForHeadlineEditor();
+    const current = (await readHeadlineEditor(headlineEditor)).trimEnd();
     const dots = current.length - current.replace(/\.+$/, "").length;
     const updated = nextHeadline(current);
 
-    await textarea.fill(updated);
-    await page
-      .getByRole("button", { name: /^save$/i })
-      .first()
-      .click();
-    await textarea.waitFor({ state: "hidden", timeout: 15000 });
+    await headlineEditor.fill(updated);
+    // Confirm the editor accepted the new value before submitting. Naukri's
+    // current headline dialog can remain open after Save, so its visibility is
+    // not a reliable indicator of whether the server accepted the change.
+    const entered = (await readHeadlineEditor(headlineEditor)).trimEnd();
+    if (entered !== updated) {
+      throw new Error(
+        `headline editor did not accept the new value (showing "${entered.slice(0, 60)}")`,
+      );
+    }
+    await page.getByRole("button", { name: /^save$/i }).first().click();
+    const editorClosed = await headlineEditor
+      .waitFor({ state: "hidden", timeout: 15000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!editorClosed) {
+      log("Headline editor stayed open after Save; checking the profile for the saved value...");
+      // Give the save request a moment to finish before reloading. The server
+      // value below is the source of truth, whether or not the modal closes.
+      await page.waitForTimeout(1500);
+    }
 
-    // modal closing isn't proof the save stuck — reload from the server and re-read
+    // Reload from the server and re-read; the modal's state isn't proof of a save.
     await page.goto(PROFILE_URL, {
       waitUntil: "domcontentloaded",
       timeout: 60000,
     });
     await editIcon.first().waitFor({ timeout: 30000 });
     await editIcon.first().click();
-    await textarea.waitFor({ timeout: 15000 });
-    const saved = (await textarea.inputValue()).trimEnd();
+    headlineEditor = await waitForHeadlineEditor();
+    const saved = (await readHeadlineEditor(headlineEditor)).trimEnd();
     if (saved !== updated) {
       throw new Error(
         `save did not stick — server headline is "${saved.slice(0, 60)}", expected "${updated.slice(0, 60)}"`,

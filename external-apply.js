@@ -13,6 +13,8 @@
  * completed unattended, and half-finishing them is worse than not starting.
  */
 
+const { aiAnswers } = require('./answer-ai');
+
 // ATSs that force account creation / email verification before the form.
 const ACCOUNT_REQUIRED = /myworkdayjobs|workday|taleo|icims|successfactors|brassring|oraclecloud|peoplestrong|smartrecruiters\.com\/.*\/login/i;
 // Not an application form at all.
@@ -54,16 +56,17 @@ const answerFor = (label, CV) => {
     [/last name|surname|family name/i, (CV.name || '').split(' ').slice(1).join(' ')],
     [/full name|^name$|your name|candidate name/i, CV.name],
     [/e-?mail/i, CV.email], // before any /address/ pattern
-    [/phone|mobile|contact\s*(no|number)|telephone/i, CV.phone], // "Enter contact no" is common on Indian ATS forms
+    [/phone|mobile|contact\s*(no|number)|telephone|\btel\b/i, CV.phone], // "Enter contact no" / "tel-253" are common on Indian ATS forms
     [/linkedin/i, CV.linkedin],
     [/github/i, CV.github],
     [/portfolio|personal (web)?site|website|blog/i, CV.portfolio],
     [/current (company|employer)|present employer|organi[sz]ation/i, CV.company],
     [/current (job )?title|current role|designation/i, CV.currentRole],
     [/notice period|when can you (start|join)|availability|start date|joining/i, CV.noticePeriod],
-    [/current .{0,15}(ctc|salary|compensation)/i, CV.currentCTC],
+    [/curr(ent)?\b.{0,15}(ctc|salary|compensation)/i, CV.currentCTC],
     [/(expected|desired) .{0,15}(ctc|salary|compensation|pay)|salary expectation/i, CV.expectedCTC],
-    [/years? of|total experience|work experience|experience \(/i, CV.yearsOfExperience || '1'],
+    // WordPress/WP Job Manager forms label this "yrs-exp" or just "Exp".
+    [/\b(yrs?|years?)\b.{0,12}\bexp(erience)?\b|\bexp(erience)?\b/i, CV.yearsOfExperience || '1'],
     [/city|current location|where are you based|location|address/i, CV.location],
     [/visa|sponsorship|work authori|legally authori|right to work/i, CV.workAuth],
     [/relocat/i, CV.relocate],
@@ -116,13 +119,24 @@ const COLLECT = () => {
 };
 
 /** Fill every field we have an answer for. Returns a per-field report. */
-async function fillFields(page, CV, resumePath) {
+async function fillFields(page, CV, resumePath, ai) {
   const fields = await page.evaluate(COLLECT);
   const report = [];
   // Labels the answer bank had nothing for. Without this the misses were invisible —
   // a "filled 3/6" line gave no way to tell whether the 3 gaps were optional extras
   // or a required field that would sink the submission.
   const missed = [];
+  // One Gemini request for every required gap, before filling starts. Only required
+  // fields are sent (optional extras aren't worth the latency), and the answer is
+  // reused across the form's 3 fill passes.
+  const labelKey = (l) => String(l || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  let aiValues = new Map();
+  if (ai) {
+    const gaps = [...new Set(fields
+      .filter((f) => f.required && !['radio', 'checkbox', 'file'].includes(f.type) && !answerFor(f.label, CV))
+      .map((f) => f.label))];
+    if (gaps.length) aiValues = await ai(gaps).catch(() => new Map());
+  }
   for (const f of fields) {
     const loc = page.locator(`[data-aa-i="${f.i}"]`).first();
     try {
@@ -144,22 +158,33 @@ async function fillFields(page, CV, resumePath) {
         report.push(`radio:${f.label.slice(0, 20)}=${f.options[n] || ''}`);
         continue;
       }
-      const answer = answerFor(f.label, CV);
-      if (!answer) { missed.push((f.required ? '*' : '') + (f.label || f.type).slice(0, 30)); continue; }
+      const fromBank = answerFor(f.label, CV);
+      const value = fromBank || aiValues.get(labelKey(f.label)) || '';
+      if (!value) { missed.push((f.required ? '*' : '') + (f.label || f.type).slice(0, 30)); continue; }
       if (f.type === 'select') {
-        const match = f.options.find((o) => o.toLowerCase().includes(String(answer).toLowerCase())) ||
+        const match = f.options.find((o) => o.toLowerCase().includes(String(value).toLowerCase())) ||
                       f.options.find((o) => YES.test(o));
         if (match) { await loc.selectOption({ label: match }, { timeout: 8000 }); report.push(`select:${f.label.slice(0, 20)}=${match}`); }
         continue;
       }
-      await loc.fill(String(answer), { timeout: 8000 });
-      report.push(`${f.label.slice(0, 25)}=${String(answer).slice(0, 25)}`);
+      await loc.fill(String(value), { timeout: 8000 });
+      report.push(`${fromBank ? '' : 'ai '}${f.label.slice(0, 25)}=${String(value).slice(0, 25)}`);
     } catch (e) { /* one stubborn field must not abort the form */ }
   }
   return { count: fields.length, report, missed };
 }
 
-const SUBMIT_RE = /^(submit|submit application|apply|apply now|send application|send|finish|complete)$/i;
+// "Submit & Next" is the commit button on one-page wizards; without the suffix clause
+// the whole form was rejected as "no submit button" after every field had been filled.
+// Several employer sites decorate the label ("Submit Application →", "Apply ›"), so
+// trailing arrows/spaces/pipes are tolerated instead of failing the whole form.
+const SUBMIT_RE = /^(submit|submit application|apply|apply now|send application|send|finish|complete)(\s*(&|and)\s*(next|continue|proceed))?[\s→➜➔›»>|]*$/i;
+
+// A human captcha ("I'm not a robot", or a math box labelled "Total") is a deliberate
+// stop sign for unattended tools, so these forms are skipped rather than attempted.
+const HAS_CAPTCHA = () => [...document.querySelectorAll(
+  'input[name*="captcha" i], input[id*="captcha" i], iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i]'
+)].some((el) => el.getClientRects().length > 0);
 const SUCCESS_RE = /thank you|thanks for (applying|your interest)|application (has been )?(received|submitted|sent|complete)|successfully applied|we (have )?received your application|your application is in/i;
 
 /** Find a submit-ish button by visible text. */
@@ -195,7 +220,7 @@ async function calibration(page, fieldCount) {
  * Apply to one external job. Returns {status, detail}.
  * status: applied | would-apply (dry run) | skipped | failed
  */
-async function applyExternal(ctx, job, { CV, live, resumePath, log = () => {} }) {
+async function applyExternal(ctx, job, { CV, live, resumePath, geminiKey, log = () => {} }) {
   const page = await ctx.newPage();
   let target = page;
   try {
@@ -222,13 +247,22 @@ async function applyExternal(ctx, job, { CV, live, resumePath, log = () => {} })
     // Two passes: the exact labels first, then anything apply-ish, but only while
     // the page still has no real form to fill — otherwise a stray "Apply" link
     // navigates us away from a form that was already there.
+    // Zoho Recruit ("I'm interested") opens the form in a NEW tab; without following
+    // it the old tab stays empty and the job was reported as "no application form".
     for (const re of [/^(apply|apply for this job|apply now|i'm interested)$/i, /apply/i]) {
       const fieldCount = (await target.evaluate(COLLECT).catch(() => [])).length;
       if (fieldCount > 2) break;
       const opener = target.locator('button, a').filter({ hasText: re }).first();
       if (!(await opener.count().catch(() => 0))) continue;
+      const pagesBefore = new Set(target.context().pages());
       await opener.click({ timeout: 8000 }).catch(() => {});
       await target.waitForTimeout(4000);
+      const opened = target.context().pages().find((p) => !pagesBefore.has(p));
+      if (opened) {
+        target = opened;
+        await target.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+        await target.waitForTimeout(3000);
+      }
     }
 
     // Confirm this is an application form before typing into it. Some handoffs land
@@ -242,10 +276,16 @@ async function applyExternal(ctx, job, { CV, live, resumePath, log = () => {} })
       return { status: 'skipped', detail: `no application form here — ${await calibration(target, probe.length)}` };
     }
 
+    if (await target.evaluate(HAS_CAPTCHA).catch(() => false)) {
+      const host = (() => { try { return new URL(target.url()).hostname; } catch (e) { return '?'; } })();
+      return { status: 'skipped', detail: `human captcha on the employer form — apply manually: ${host}` };
+    }
+
     // up to 3 passes: fill → submit → (next step of a multi-step form)
     let filledTotal = 0;
+    const ai = geminiKey ? (labels) => aiAnswers(labels, CV, { key: geminiKey }) : null;
     for (let step = 0; step < 3; step++) {
-      const { count, report, missed } = await fillFields(target, CV, resumePath);
+      const { count, report, missed } = await fillFields(target, CV, resumePath, ai);
       filledTotal += report.length;
       if (report.length) log(`    filled ${report.length}/${count}: ${report.slice(0, 6).join(', ')}`);
       // "*" marks a required field — those are the ones that will block a real submit.

@@ -43,12 +43,15 @@ assert.strictEqual(answerFor('Expected CTC', CV), '20');
 assert.strictEqual(answerFor('Notice period', CV), '15 days');
 assert.strictEqual(answerFor('LinkedIn Profile URL', CV), 'li/x');
 assert.strictEqual(answerFor('Total years of experience', CV), '2');
+assert.strictEqual(answerFor('yrs-exp', CV), '2', 'WP Job Manager experience field');
+assert.strictEqual(answerFor('CurrCTC', CV), '10', 'abbreviated current CTC field');
+assert.strictEqual(answerFor('tel-253', CV), '99999', 'WP Job Manager phone field');
 assert.strictEqual(answerFor('Current city', CV), 'Bengaluru');
 assert.ok(answerFor('Why do you want to join us?', CV).includes('Ankit Baghel'));
 assert.strictEqual(answerFor('Favourite colour', CV), '', 'unknown fields stay empty, never guessed');
 
 // ---- submit / success matching ----
-for (const t of ['Submit', 'Submit Application', 'Apply Now', 'Send Application'])
+for (const t of ['Submit', 'Submit Application', 'Apply Now', 'Send Application', 'Submit & Next', 'Submit and Continue', 'Submit Application →', 'Apply ›'])
   assert.ok(SUBMIT_RE.test(t), `should be a submit button: ${t}`);
 for (const t of ['Back', 'Save draft', 'Cancel', 'Apply filters'])
   assert.ok(!SUBMIT_RE.test(t), `must NOT be treated as submit: ${t}`);

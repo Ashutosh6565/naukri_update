@@ -5,6 +5,7 @@
 *.log
 applications*.csv
 apply-state-*.json
+apply-lock-*.json
 *.png
 
 # saved browser sessions (contain logged-in cookies)

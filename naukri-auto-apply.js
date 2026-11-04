@@ -151,23 +151,34 @@
       if (pattern.test(questionText)) return answer;
     }
     if (CONFIG.geminiKey) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${CONFIG.geminiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text:
-                `You are answering a job application chatbot question on my behalf. Answer in first person, 1-3 sentences, professional, no markdown. If the question expects a number, answer with just the number.\n\nMy CV:\n${JSON.stringify(CV)}\n\nQuestion: ${questionText}` }] }],
-            }),
-          }
-        );
-        const data = await res.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (text) return text;
-      } catch (e) {
-        log('Gemini call failed, using generic answer:', e.message);
+      // gemini-2.0-flash is retired; 3.5-flash answers in ~1s with thinking off, and
+      // the abort keeps a stalled request from freezing the questionnaire.
+      for (const model of ['gemini-3.5-flash', 'gemini-flash-lite-latest']) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 15000);
+        try {
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CONFIG.geminiKey}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal: ac.signal,
+              body: JSON.stringify({
+                contents: [{ parts: [{ text:
+                  `You are answering a job application chatbot question on my behalf. Answer in first person, 1-3 sentences, professional, no markdown. If the question expects a number, answer with just the number.\n\nMy CV:\n${JSON.stringify(CV)}\n\nQuestion: ${questionText}` }] }],
+                generationConfig: { maxOutputTokens: 300, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
+              }),
+            }
+          );
+          if (!res.ok) continue;
+          const data = await res.json();
+          const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join(' ').trim();
+          if (text) return text;
+        } catch (e) {
+          log('Gemini call failed (' + model + '):', e.message);
+        } finally {
+          clearTimeout(timer);
+        }
       }
     }
     return GENERIC_ANSWER;

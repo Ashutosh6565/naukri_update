@@ -167,16 +167,16 @@ ${CV.name}`;
 
   // Company name from the opened job pane. Falls back to '' (letter then says
   // "Hi there team" / "your team") rather than a wrong heading like "About the job".
-  function getCompany() {
+  function getCompany(root = document) {
     // 2026 UI: the apply panel header reads "Apply to <Company>"
-    const panelHeader = [...document.querySelectorAll('h1, h2, h3, div')]
+    const panelHeader = [...root.querySelectorAll('h1, h2, h3, div')]
       .map((e) => (e.children.length === 0 ? e.textContent.trim() : ''))
       .find((t) => /^apply to .{2,60}$/i.test(t));
     if (panelHeader) return panelHeader.replace(/^apply to /i, '').trim();
     const el =
-      document.querySelector('a[href^="/company/"] h2') ||
-      document.querySelector('[data-test="StartupHeader"] h1') ||
-      document.querySelector('a[href^="/company/"]');
+      root.querySelector('a[href^="/company/"] h2') ||
+      root.querySelector('[data-test="StartupHeader"] h1') ||
+      root.querySelector('a[href^="/company/"]');
     let name = (el?.textContent || '').split('\n')[0].replace(/\s+/g, ' ').trim();
     // Reject obvious non-names (section headings, buttons, follower counts)
     if (/about the job|about us|apply|jobs|follow|save|^$/i.test(name) || name.split(' ').length > 6) name = '';
@@ -203,23 +203,34 @@ ${CV.name}`;
       if (pattern.test(questionText)) return answer;
     }
     if (CONFIG.geminiKey) {
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${CONFIG.geminiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text:
-                `You are answering a job application question on my behalf. Answer in first person, 2-4 sentences, professional, no markdown.\n\nMy CV:\n${JSON.stringify(CV)}\n\nQuestion: ${questionText}` }] }],
-            }),
-          }
-        );
-        const data = await res.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (text) return text;
-      } catch (e) {
-        log('Gemini call failed, using generic answer:', e.message);
+      // gemini-2.0-flash is retired; 3.5-flash answers in ~1s with thinking off, and
+      // the abort keeps a stalled request from freezing the apply dialog.
+      for (const model of ['gemini-3.5-flash', 'gemini-flash-lite-latest']) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 15000);
+        try {
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${CONFIG.geminiKey}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal: ac.signal,
+              body: JSON.stringify({
+                contents: [{ parts: [{ text:
+                  `You are answering a job application question on my behalf. Answer in first person, 2-4 sentences, professional, no markdown.\n\nMy CV:\n${JSON.stringify(CV)}\n\nQuestion: ${questionText}` }] }],
+                generationConfig: { maxOutputTokens: 400, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
+              }),
+            }
+          );
+          if (!res.ok) continue;
+          const data = await res.json();
+          const text = (data?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join(' ').trim();
+          if (text) return text;
+        } catch (e) {
+          log('Gemini call failed (' + model + '):', e.message);
+        } finally {
+          clearTimeout(timer);
+        }
       }
     }
     return GENERIC_ANSWER;
@@ -281,18 +292,43 @@ ${CV.name}`;
     return null;
   }
 
+  // Cancel is the apply dialog's only close control — it has no ✕ (verified 2026-11-04).
+  // When an SPA route change orphans the modal its click handlers are gone, so a plain
+  // Cancel click does nothing; fall back to Escape and finally remove the overlay.
+  async function dismissDialog(d) {
+    findButtonByText(d, /^(cancel|close|dismiss|×|✕)$/i)?.click();
+    if (await waitFor(() => !d.isConnected || !visible(d), 2500)) return;
+    for (const target of [d, document]) {
+      target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+    }
+    if (await waitFor(() => !d.isConnected || !visible(d), 2500)) return;
+    const overlay = d.closest('.ReactModal__Overlay') || d.parentElement;
+    (overlay || d).remove();
+    log('  ⚠ dialog would not close — removed it from the page');
+    await waitFor(() => !applyDialog(), 2000);
+  }
+
+  // Whatever path the flow took (including a thrown error mid-fill), never leave a
+  // dialog behind: the next job would start on a stale form.
+  async function sweepDialogs() {
+    const d = applyDialog();
+    if (!d) return;
+    log('  ⚠ closing the apply dialog left open by the previous step');
+    await dismissDialog(d);
+  }
+
   // ======================= APPLY TO ONE JOB (inside opened modal/pane) =======================
   async function fillAndSubmit(company, title, href) {
     // Opening the job card only shows the job pane — the apply form does not exist yet.
     // Click this job's own "Apply" button to open the dialog that holds the real form.
-    // A dialog left open here belongs to the PREVIOUS job (its close click missed).
-    // Reusing it would submit this job's cover letter to that job — always start clean.
+    // A dialog left open here belongs to the PREVIOUS job (an SPA route change keeps the
+    // React modal portal mounted and kills its handlers). Reusing it would submit this
+    // job's cover letter to that job — always start clean.
+    const dialogsBefore = new Set([...document.querySelectorAll(SELECTORS.modal)]);
     const stale = applyDialog();
     if (stale) {
       log('  ⚠ stale apply dialog from the previous job — closing it first');
-      findButtonByText(stale, /^cancel$|close/i)?.click();
-      stale.querySelector('[aria-label="Close"]')?.click();
-      await waitFor(() => !applyDialog(), 5000);
+      await dismissDialog(stale);
     }
     const openBtn = findApplyButtonFor(href);
     if (!openBtn) {
@@ -302,26 +338,36 @@ ${CV.name}`;
     openBtn.scrollIntoView({ block: 'center' });
     await sleep(400);
     openBtn.click();
-    const modal = await waitFor(applyDialog, 15000);
+    // Only accept a dialog that did not exist before the click. Matching any visible
+    // dialog returned the stale one instantly, and the whole form was filled — and
+    // Send clicked — on the wrong job.
+    const modal = await waitFor(() => {
+      const d = applyDialog();
+      return d && !dialogsBefore.has(d) ? d : null;
+    }, 15000);
     if (!modal) {
       log('  ⚠ apply dialog never opened — skipping (not counting as sent)');
       return false;
     }
     const scope = modal;
+    // The company passed in comes from the feed card, which usually has none; the old
+    // fallback then took the FIRST company link on the page, i.e. a promoted card's —
+    // every cover letter went out addressed to "Certa". The dialog header is the only
+    // per-job source, so prefer it once the form is open.
+    const jobCompany = (company && company !== '?' ? company : getCompany(scope)) || company || '';
 
     // Location-gated job ("X is not accepting applications from your current location…")
     // → Send is disabled, nothing we fill changes that. Skip immediately.
     if (/not accepting applications from your (current )?location/i.test(scope.textContent)) {
       log('  🚫 location-blocked by company — skipping');
-      findButtonByText(scope, /close|cancel|×/i)?.click();
-      scope.querySelector('[aria-label="Close"]')?.click();
+      await dismissDialog(scope);
       return false;
     }
 
     // 1. Cover letter: the big textarea ("What interests you about working for this company?")
     const textareas = [...scope.querySelectorAll('textarea')].filter(visible);
     if (textareas.length) {
-      setValue(textareas[0], coverLetter(company, title));
+      setValue(textareas[0], coverLetter(jobCompany, title));
       log('  ✍ cover letter filled');
     }
 
@@ -447,15 +493,13 @@ ${CV.name}`;
       log(disabledBtn
         ? '  🚫 Send button is disabled (application blocked) — skipping'
         : '  ⚠ no Send button found after waiting — skipping');
-      findButtonByText(scope, /close|cancel|×/i)?.click();
-      scope.querySelector('[aria-label="Close"]')?.click();
+      await dismissDialog(scope);
       return false;
     }
     if (CONFIG.DRY_RUN) {
       log('  🔍 DRY_RUN — would click:', sendBtn.textContent.trim());
       // close the modal so the loop can continue
-      findButtonByText(scope, /close|cancel|×/i)?.click();
-      scope.querySelector('[aria-label="Close"]')?.click();
+      await dismissDialog(scope);
       return true;
     }
     sendBtn.click();
@@ -463,11 +507,21 @@ ${CV.name}`;
     // VERIFY. A click is not a submission: the old code logged "sent" here and moved on,
     // which is how 54 phantom applications got recorded on 2026-08-12 while Wellfound's
     // Applied tab still showed Jul 31. Only a dialog that actually closes counts.
-    const closed = await waitFor(() => !applyDialog(), 25000);
+    // Only THIS dialog closing counts. Another (orphaned) dialog elsewhere on the page
+    // must not decide whether our submission registered.
+    const closed = await waitFor(() => !scope.isConnected || !visible(scope), 25000);
     if (!closed) {
-      const err = (scope.innerText.match(/.*(required|error|please|invalid|try again).*/i) || [''])[0].trim().slice(0, 120);
-      log(`  ❌ submit did NOT go through — dialog still open${err ? ` | ${err}` : ''} — NOT counted`);
-      findButtonByText(scope, /^cancel$|close/i)?.click();
+      // Name the fields the form still considers unanswered. Echoing the first line that
+      // contained "required" only ever said "required" — no way to fix anything with it.
+      const blockers = [...scope.querySelectorAll('input, textarea, select, [role="combobox"]')]
+        .filter(visible)
+        .filter((e) => e.getAttribute('aria-invalid') === 'true' ||
+          ((e.required || e.getAttribute('aria-required') === 'true') &&
+           !['radio', 'checkbox', 'file'].includes(e.type) && !String(e.value || '').trim()))
+        .map((e) => (labelTextOf(e) || e.name || e.id || e.tagName).replace(/\s+/g, ' ').slice(0, 50))
+        .slice(0, 3);
+      log(`  ❌ submit did NOT go through — dialog still open${blockers.length ? ` | unanswered: ${blockers.join(' · ')}` : ''} — NOT counted`);
+      await dismissDialog(scope);
       return false;
     }
     // Extra (non-blocking) confirmation: the card usually flips to an "Applied" stamp.
@@ -620,6 +674,7 @@ ${CV.name}`;
     } else {
       log(`⏭ job page "${title}" does not match the title filters — skipping`);
     }
+    await sweepDialogs();
     log('↩ returning to the jobs feed');
     if (window.next?.router?.push) window.next.router.push('/jobs'); else location.href = '/jobs';
     return; // the feed load re-injects a fresh run
@@ -665,6 +720,7 @@ ${CV.name}`;
       applied++;
       log(`  progress: ${applied}/${CONFIG.MAX_APPLICATIONS}`);
     }
+    await sweepDialogs();
     // close the job overlay (top-right ✕) so the next card is clickable
     await sleep(1000);
     (document.querySelector('button[aria-label="Close" i], [class*="Modal" i] button[class*="close" i]') ||
